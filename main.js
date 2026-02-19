@@ -71,7 +71,7 @@ function loadServerUrl() {
       if (['http:', 'https:'].includes(p.protocol)) return cfg.serverUrl
     }
   } catch {}
-  return APP_URL
+  return null // null = first run, no server configured yet
 }
 
 function saveServerUrl(url) {
@@ -620,13 +620,21 @@ function registerIpcHandlers() {
 
   // ── Server URL config ───────────────────────────────────────────────────────
   ipcMain.handle('configure-server', () => showConfigWindow())
+  ipcMain.on('config-cancel-first-run', () => { isQuitting = true; app.quit() })
   ipcMain.on('config-set-server-url', (_e, url) => {
     try {
       const p = new URL(url)
       if (!['http:', 'https:'].includes(p.protocol)) return
       appUrl = url
       saveServerUrl(url)
-      if (isWindowReady()) mainWindow.loadURL(appUrl)
+      if (isWindowReady()) {
+        // Reconfiguring an existing session — just reload
+        mainWindow.loadURL(appUrl)
+      } else {
+        // First run — main window doesn't exist yet, create it now
+        createWindow()
+        createTray()
+      }
     } catch {}
   })
 }
@@ -634,13 +642,13 @@ function registerIpcHandlers() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Config window  (Change Server URL)
 // ─────────────────────────────────────────────────────────────────────────────
-function showConfigWindow() {
+function showConfigWindow(firstRun = false) {
   if (configWindow && !configWindow.isDestroyed()) { configWindow.focus(); return }
   configWindow = new BrowserWindow({
     width: 480,
-    height: 230,
+    height: firstRun ? 280 : 230,
     resizable: false,
-    title: `${APP_NAME} — Configure Server`,
+    title: firstRun ? `Welcome to ${APP_NAME}` : `${APP_NAME} — Configure Server`,
     autoHideMenuBar: true,
     webPreferences: {
       nodeIntegration: true,
@@ -648,9 +656,12 @@ function showConfigWindow() {
     },
   })
   Menu.setApplicationMenu(null)
-  const serverUrlJson = JSON.stringify(appUrl)
+  const serverUrlJson = JSON.stringify(appUrl || APP_URL)
+  const firstRunJson = JSON.stringify(firstRun)
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
   body{background:#1a1a2e;color:#ccc;font-family:sans-serif;padding:24px;margin:0}
+  h2{margin:0 0 14px;color:#fff;font-size:16px}
+  .sub{font-size:12px;opacity:.55;margin:-10px 0 16px}
   label{display:block;margin-bottom:8px;font-size:13px;opacity:.8}
   input{width:100%;padding:8px 10px;background:#2a2a4e;color:#fff;border:1px solid #444;
         border-radius:5px;font-size:14px;box-sizing:border-box;outline:none}
@@ -661,26 +672,37 @@ function showConfigWindow() {
   button:hover{background:#6d28d9}
   .cancel{background:#333}.cancel:hover{background:#444}
   .hint{font-size:11px;opacity:.5;margin-top:8px}
+  .err{font-size:12px;color:#e06c75;margin-top:6px;min-height:16px}
 </style></head><body>
+${firstRun ? `<h2>Connect to a Fluxer Server</h2><p class="sub">Enter the address of your Fluxer instance to get started.</p>` : ''}
 <label>Server URL</label>
 <input type="text" id="u" value="" placeholder="https://chat.example.com">
 <p class="hint">e.g. https://chat.example.com &nbsp;or&nbsp; http://192.168.1.10:3000</p>
+<p class="err" id="err"></p>
 <div class="row">
-  <button onclick="save()">Save &amp; Reconnect</button>
-  <button class="cancel" onclick="window.close()">Cancel</button>
+  <button onclick="save()">${firstRun ? 'Connect' : 'Save &amp; Reconnect'}</button>
+  <button class="cancel" onclick="cancel()">${firstRun ? 'Quit' : 'Cancel'}</button>
 </div>
 <script>
 const {ipcRenderer}=require('electron')
 const SERVER_URL=${serverUrlJson}
-document.getElementById('u').value=SERVER_URL
-document.getElementById('u').select()
+const FIRST_RUN=${firstRunJson}
+const inp=document.getElementById('u')
+inp.value=SERVER_URL
+inp.select()
 function save(){
-  const v=document.getElementById('u').value.trim()
-  if(!v)return
+  const v=inp.value.trim()
+  if(!v){document.getElementById('err').textContent='Please enter a URL.';return}
+  try{const p=new URL(v);if(!['http:','https:'].includes(p.protocol)){throw new Error()}}
+  catch{document.getElementById('err').textContent='Must start with http:// or https://';return}
   ipcRenderer.send('config-set-server-url',v)
   window.close()
 }
-document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')save()})
+function cancel(){
+  if(FIRST_RUN){ipcRenderer.send('config-cancel-first-run')}
+  window.close()
+}
+inp.addEventListener('keydown',e=>{if(e.key==='Enter')save()})
 </script></body></html>`
   configWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
   // Block any navigation away from the inline data: URL — nodeIntegration is enabled
@@ -688,7 +710,11 @@ document.getElementById('u').addEventListener('keydown',e=>{if(e.key==='Enter')s
   configWindow.webContents.on('will-navigate', (event, url) => {
     if (!url.startsWith('data:')) event.preventDefault()
   })
-  configWindow.on('closed', () => { configWindow = null })
+  configWindow.on('closed', () => {
+    configWindow = null
+    // If user closes the first-run window without saving, quit
+    if (firstRun && !isWindowReady()) app.quit()
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1000,8 +1026,14 @@ function createTray() {
 app.whenReady().then(() => {
   appUrl = loadServerUrl()
   registerIpcHandlers()
-  createWindow()
-  createTray()
+  if (appUrl) {
+    // Returning user — go straight to the app
+    createWindow()
+    createTray()
+  } else {
+    // First run — ask which server to connect to before opening the main window
+    showConfigWindow(true)
+  }
 }).catch(err => {
   console.error('[App] Fatal startup error:', err)
   app.quit()
