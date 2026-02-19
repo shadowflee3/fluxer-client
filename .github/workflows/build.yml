@@ -1,0 +1,40 @@
+name: Build installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate icon
+        run: node scripts/create-icon.js
+
+      - name: Build macOS DMG
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-builder --mac --x64 --arm64
+
+      - name: Upload DMG (Intel)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fluxer-mac-x64
+          path: dist/*-x64.dmg
+
+      - name: Upload DMG (Apple Silicon)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fluxer-mac-arm64
+          path: dist/*-arm64.dmg
