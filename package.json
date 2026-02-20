@@ -19,6 +19,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "config-preload.js",
       "assets/**",
       "node_modules/**"
     ],
