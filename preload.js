@@ -115,6 +115,12 @@ const api = {
   closeNotifications: ids => ipcRenderer.send('close-notifications', ids),
   onNotificationClick: cb => on('notification-click', cb),
 
+  // Custom notification sound
+  notificationSoundPick: () => ipcRenderer.invoke('notification-sound-pick'),
+  notificationSoundClear: () => ipcRenderer.invoke('notification-sound-clear'),
+  notificationSoundGet: () => ipcRenderer.invoke('notification-sound-get'),
+  notificationSoundPreview: () => ipcRenderer.invoke('notification-sound-preview'),
+
   // App badge (Windows taskbar overlay)
   setBadgeCount: count => ipcRenderer.send('set-badge-count', count),
   getBadgeCount: () => ipcRenderer.invoke('get-badge-count'),
@@ -180,6 +186,20 @@ window.addEventListener('contextmenu', event => {
   const isTextarea = event.target?.nodeName === 'TEXTAREA'
   ipcRenderer.send('spellcheck-context-target', { isTextarea })
 }, true)
+
+// Custom notification sound — main process sends a base64 data URI whenever a
+// notification fires and the user has configured a custom sound file.
+// The renderer plays it via HTML5 Audio so it works cross-platform without
+// needing any native audio libraries in the main process.
+// Uses the on() wrapper to deduplicate listeners across page reloads.
+on('play-notification-sound', (dataUri) => {
+  try {
+    if (typeof dataUri !== 'string' || !dataUri.startsWith('data:audio/')) return
+    const audio = new Audio(dataUri)
+    audio.volume = 1.0
+    audio.play().catch(() => {})
+  } catch {}
+})
 
 // Expose as window.electron — the exact name Fluxer's web app checks
 contextBridge.exposeInMainWorld('electron', api)

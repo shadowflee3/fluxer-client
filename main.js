@@ -62,6 +62,10 @@ const activeNotifications = new Map() // id → { notification, url, autoCleanTi
 // Module-level so before-quit can cancel a pending write during shutdown.
 let _badgeDebounceTimer = null
 
+// ── Custom notification sound ─────────────────────────────────────────────────
+let _notifSoundPath = null        // absolute path to user-chosen audio file, or null
+let _pickingSoundInProgress = false // guard against concurrent file-picker dialogs
+
 // ── Configurable server URL ───────────────────────────────────────────────────
 let appUrl = APP_URL // Overridden at startup from saved config
 let configWindow = null
@@ -124,6 +128,85 @@ function applyTheme(theme) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ── Notification sound helpers ────────────────────────────────────────────────
+
+// Validate audio by magic bytes, not file extension (extension can be spoofed).
+function validateAudioMime(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return null
+  // WAV: "RIFF"
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return 'audio/wav'
+  // OGG: "OggS"
+  if (buf[0] === 0x4F && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) return 'audio/ogg'
+  // MP3: ID3 tag header
+  if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return 'audio/mpeg'
+  // MP3: MPEG sync frame (FF E* or FF F*)
+  if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return 'audio/mpeg'
+  return null
+}
+
+function loadNotificationSound() {
+  _notifSoundPath = null
+  try {
+    const cfgPath = path.join(app.getPath('userData'), 'config.json')
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    if (typeof cfg.notificationSound === 'string' && cfg.notificationSound) {
+      const st = fs.statSync(cfg.notificationSound)
+      if (st.isFile()) _notifSoundPath = cfg.notificationSound
+    }
+  } catch {}
+}
+
+// Read the custom sound file and return a base64 data URI.
+// Returns null if no custom sound is set or the file is invalid/too large.
+function getNotificationSoundDataUri() {
+  if (!_notifSoundPath) return null
+  try {
+    const st = fs.statSync(_notifSoundPath)
+    if (!st.isFile() || st.size > 5 * 1024 * 1024) { _notifSoundPath = null; return null }
+    const buf = fs.readFileSync(_notifSoundPath)
+    const mime = validateAudioMime(buf)
+    if (!mime) { _notifSoundPath = null; return null }
+    return `data:${mime};base64,${buf.toString('base64')}`
+  } catch { _notifSoundPath = null; return null }
+}
+
+// Send the custom sound to the renderer to play via HTML5 Audio.
+function playNotificationSound() {
+  const dataUri = getNotificationSoundDataUri()
+  if (!dataUri || !isWindowReady()) return
+  try { mainWindow.webContents.send('play-notification-sound', dataUri) } catch {}
+}
+
+// Open a file picker and, if the user picks a valid audio file, save it.
+async function pickNotificationSound(parentWin) {
+  if (_pickingSoundInProgress) return { success: false, error: 'Picker already open' }
+  _pickingSoundInProgress = true
+  const win = parentWin && !parentWin.isDestroyed() ? parentWin : (isWindowReady() ? mainWindow : null)
+  try {
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Choose Notification Sound',
+      filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'ogg'] }],
+      properties: ['openFile'],
+    })
+    if (result.canceled || !result.filePaths.length) return { success: false }
+    const filePath = result.filePaths[0]
+    const buf = fs.readFileSync(filePath)
+    if (buf.length > 5 * 1024 * 1024) return { success: false, error: 'File too large (max 5 MB)' }
+    if (!validateAudioMime(buf)) return { success: false, error: 'Unsupported format — use MP3, WAV, or OGG' }
+    _notifSoundPath = filePath
+    saveConfig({ notificationSound: filePath })
+    rebuildTrayMenu()
+    return { success: true, name: path.basename(filePath) }
+  } catch (err) { return { success: false, error: err.message } }
+  finally { _pickingSoundInProgress = false }
+}
+
+function clearNotificationSound() {
+  _notifSoundPath = null
+  saveConfig({ notificationSound: null })
+  rebuildTrayMenu()
+}
 
 function escHtml(str) {
   if (str == null) return ''
@@ -630,7 +713,9 @@ function registerIpcHandlers() {
       const n = new Notification({
         title: String(options.title ?? 'Notification').slice(0, 256),
         body: String(options.body ?? '').slice(0, 1024),
-        silent: Boolean(options.silent),
+        // Suppress system sound when a custom sound is configured so we can
+        // play our own file instead. Honour options.silent unconditionally.
+        silent: Boolean(options.silent) || !!_notifSoundPath,
         ...(notifIcon ? { icon: notifIcon } : {}),
       })
       // Auto-cleanup after 30s in case 'close' event never fires on this platform
@@ -656,6 +741,9 @@ function registerIpcHandlers() {
         activeNotifications.delete(id)
       })
       n.show()
+      // Play custom sound after showing. Skip if the caller explicitly requested
+      // silence — that flag suppresses both the system sound AND our custom one.
+      if (!Boolean(options.silent)) playNotificationSound()
     } catch (err) {
       console.error('[Notification] Failed to show:', err)
     }
@@ -688,6 +776,15 @@ function registerIpcHandlers() {
       } catch {}
     }
   })
+
+  // ── Custom notification sound ────────────────────────────────────────────────
+  ipcMain.handle('notification-sound-pick', async event => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return await pickNotificationSound(win)
+  })
+  ipcMain.handle('notification-sound-clear', () => { clearNotificationSound(); return true })
+  ipcMain.handle('notification-sound-get', () => _notifSoundPath ? path.basename(_notifSoundPath) : null)
+  ipcMain.handle('notification-sound-preview', () => { playNotificationSound(); return true })
 
   // ── Spellcheck stubs ────────────────────────────────────────────────────────
   ipcMain.handle('spellcheck-get-state', () => ({ enabled: false, languages: [] }))
@@ -1239,6 +1336,19 @@ function rebuildTrayMenu() {
         },
       ],
     },
+    {
+      label: 'Notification Sound',
+      submenu: [
+        {
+          label: _notifSoundPath ? `Current: ${path.basename(_notifSoundPath)}` : 'Set Custom Sound…',
+          click: () => pickNotificationSound(),
+        },
+        ...(_notifSoundPath ? [
+          { label: 'Preview Sound', click: () => playNotificationSound() },
+          { label: 'Clear Custom Sound', click: () => clearNotificationSound() },
+        ] : []),
+      ],
+    },
     { type: 'separator' },
     { label: 'Settings', click: () => { if (isWindowReady()) mainWindow.webContents.send('open-settings') } },
     { label: 'Change Server URL…', click: () => showConfigWindow() },
@@ -1283,6 +1393,7 @@ app.whenReady().then(() => {
   if (savedUrl) appUrl = savedUrl // keep APP_URL as fallback so appUrl is never null
   currentTheme = loadTheme()
   nativeTheme.themeSource = currentTheme
+  loadNotificationSound()
   registerIpcHandlers()
   if (savedUrl) {
     // Returning user — go straight to the app
