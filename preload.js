@@ -4,10 +4,25 @@ const { contextBridge, ipcRenderer } = require('electron')
 // The web app checks window.electron to detect the desktop app and enable
 // PTT keybinding, screen sharing, notifications, and other desktop features.
 
+// Per-channel handler map — tracks only our own active listener per channel.
+// Using removeAllListeners would also remove Electron-internal listeners on the
+// same channel; instead we track and remove only the one we registered.
+const _channelHandlers = new Map()
+
 const on = (channel, cb) => {
+  // Remove our previous listener for this channel (if any) before adding the new one.
+  // The web app may call registration functions multiple times (e.g. on re-render),
+  // and ipcRenderer.on() does not deduplicate — without this each call stacks a new
+  // listener causing duplicate events and memory leaks.
+  const prev = _channelHandlers.get(channel)
+  if (prev) ipcRenderer.removeListener(channel, prev)
   const h = (_e, ...args) => cb(...args)
+  _channelHandlers.set(channel, h)
   ipcRenderer.on(channel, h)
-  return () => ipcRenderer.removeListener(channel, h)
+  return () => {
+    ipcRenderer.removeListener(channel, h)
+    if (_channelHandlers.get(channel) === h) _channelHandlers.delete(channel)
+  }
 }
 
 const api = {
@@ -148,9 +163,21 @@ const api = {
     ipcRenderer.invoke('spellcheck-add-word-to-dictionary', word),
 }
 
-// Let the spellcheck context menu handler know what's under the cursor
+// Let the spellcheck context menu handler know what's under the cursor.
+// Throttled to 100 ms so a page cannot flood the main process IPC queue by
+// rapidly dispatching synthetic contextmenu events.
+let _contextmenuLastSent = 0
+// Reset throttle on navigation so the first right-click on a new page is
+// never silently suppressed by a stale timestamp from the previous page.
+window.addEventListener('beforeunload', () => { _contextmenuLastSent = 0 })
 window.addEventListener('contextmenu', event => {
-  const isTextarea = Boolean(event.target?.closest?.('textarea'))
+  const now = Date.now()
+  if (now - _contextmenuLastSent < 100) return
+  _contextmenuLastSent = now
+  // Use nodeName instead of instanceof — instanceof across the context-isolation
+  // boundary can fail because the main-world element's prototype chain does not
+  // include the isolated world's HTMLTextAreaElement.prototype.
+  const isTextarea = event.target?.nodeName === 'TEXTAREA'
   ipcRenderer.send('spellcheck-context-target', { isTextarea })
 }, true)
 

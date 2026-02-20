@@ -4,6 +4,7 @@ const {
   Tray,
   Menu,
   nativeImage,
+  nativeTheme,
   shell,
   ipcMain,
   desktopCapturer,
@@ -17,6 +18,7 @@ const fs = require('fs')
 const https = require('https')
 const http = require('http')
 const os = require('os')
+const crypto = require('crypto')
 
 const APP_URL = 'https://chat.shadowflee.com'
 const APP_NAME = 'Fluxer'
@@ -48,7 +50,6 @@ const registeredKeybinds = new Map()
 // ── Screen sharing ────────────────────────────────────────────────────────────
 // Unified Map keyed by requestId so callback and timeout are always in sync
 const pendingDisplayRequests = new Map() // requestId → { callback, timeout }
-let displayRequestCounter = 0
 const cachedSources = new Map()
 
 // ── Global shortcuts ──────────────────────────────────────────────────────────
@@ -56,7 +57,10 @@ const registeredShortcuts = new Map()
 
 // ── Notifications ─────────────────────────────────────────────────────────────
 const activeNotifications = new Map() // id → { notification, url, autoCleanTimeout }
-let notificationIdCounter = 0
+
+// ── App badge debounce ─────────────────────────────────────────────────────────
+// Module-level so before-quit can cancel a pending write during shutdown.
+let _badgeDebounceTimer = null
 
 // ── Configurable server URL ───────────────────────────────────────────────────
 let appUrl = APP_URL // Overridden at startup from saved config
@@ -74,13 +78,47 @@ function loadServerUrl() {
   return null // null = first run, no server configured yet
 }
 
-function saveServerUrl(url) {
+// ── Centralised config persistence ───────────────────────────────────────────
+// A single read-modify-write prevents concurrent saves (e.g. saveServerUrl and
+// saveTheme called in the same tick) from clobbering each other's keys.
+function saveConfig(patch) {
+  const cfgPath = path.join(app.getPath('userData'), 'config.json')
+  const tmp = cfgPath + '.tmp'
   try {
-    fs.writeFileSync(
-      path.join(app.getPath('userData'), 'config.json'),
-      JSON.stringify({ serverUrl: url })
-    )
+    let cfg = {}
+    try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch {}
+    Object.assign(cfg, patch)
+    // Spread into a fresh object so any accidental toJSON property on cfg or patch
+    // cannot hijack JSON.stringify output.
+    fs.writeFileSync(tmp, JSON.stringify({ ...cfg }))
+    fs.renameSync(tmp, cfgPath)
+  } catch {
+    // Remove partial temp file so it doesn't accumulate on disk
+    try { fs.unlinkSync(tmp) } catch {}
+  }
+}
+
+function saveServerUrl(url) { saveConfig({ serverUrl: url }) }
+
+// ── Theme (dark / light / system) ────────────────────────────────────────────
+let currentTheme = 'dark' // default to dark
+
+function loadTheme() {
+  try {
+    const cfgPath = path.join(app.getPath('userData'), 'config.json')
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    if (['dark', 'light', 'system'].includes(cfg.theme)) return cfg.theme
   } catch {}
+  return 'dark'
+}
+
+function saveTheme(theme) { saveConfig({ theme }) }
+
+function applyTheme(theme) {
+  currentTheme = theme
+  nativeTheme.themeSource = theme
+  saveTheme(theme)
+  rebuildTrayMenu()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,9 +247,13 @@ function handleMouseEvent(event, type) {
   }
 }
 
+let _startHookPromise = null
 async function startHook() {
   if (hookStarted) return true
-  try {
+  // Prevent concurrent start calls from double-registering listeners
+  if (_startHookPromise) return _startHookPromise
+  _startHookPromise = (async () => {
+    try {
     const mod = require('uiohook-napi')
     uIOhook = mod.uIOhook
     UiohookKey = mod.UiohookKey
@@ -220,29 +262,40 @@ async function startHook() {
     uIOhook.on('keyup', e => handleKeyEvent(e, 'keyup'))
     uIOhook.on('mousedown', e => handleMouseEvent(e, 'mousedown'))
     uIOhook.on('mouseup', e => handleMouseEvent(e, 'mouseup'))
+    uIOhook.on('error', err => {
+      console.error('[KeyHook] Runtime error:', err)
+      // Mirror stopHook cleanup so stale listeners don't fire on a future restart
+      hookStarted = false
+      try { uIOhook.removeAllListeners() } catch {}
+      try { uIOhook.stop() } catch {}
+    })
     uIOhook.start()
     hookStarted = true // Only set after successful start so is-running reports accurately
     console.log('[KeyHook] Started')
     return true
-  } catch (err) {
-    console.error('[KeyHook] Failed to start:', err)
-    // Clean up partial state so a retry is safe
-    if (uIOhook) {
-      try { uIOhook.removeAllListeners() } catch {}
-      try { uIOhook.stop() } catch {}
+    } catch (err) {
+      console.error('[KeyHook] Failed to start:', err)
+      // Clean up partial state so a retry is safe
+      if (uIOhook) {
+        try { uIOhook.removeAllListeners() } catch {}
+        try { uIOhook.stop() } catch {}
+      }
+      hookStarted = false
+      return false
+    } finally {
+      _startHookPromise = null
     }
-    hookStarted = false
-    return false
-  }
+  })()
+  return _startHookPromise
 }
 
 function stopHook() {
   if (!hookStarted || !uIOhook) return
-  try { uIOhook.stop() } catch {}
-  // Remove listeners so handleKeyEvent/handleMouseEvent cannot fire
-  // between stop and the next startHook() call
-  try { uIOhook.removeAllListeners() } catch {}
+  // Set flag first so handleKeyEvent/handleMouseEvent guards take effect immediately,
+  // before any native-buffered events queued after stop() can be delivered.
   hookStarted = false
+  try { uIOhook.removeAllListeners() } catch {}
+  try { uIOhook.stop() } catch {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,14 +304,21 @@ function stopHook() {
 function downloadToFile(url, destPath, redirects = 0) {
   return new Promise((resolve, reject) => {
     if (redirects > 10) { reject(new Error('Too many redirects')); return }
-    const protocol = url.toLowerCase().startsWith('https://') ? https : http
+    // Validate protocol here too — redirect Location headers are untrusted
+    let parsedUrl
+    try { parsedUrl = new URL(url) } catch { reject(new Error('Invalid URL')); return }
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+      reject(new Error('Invalid URL protocol')); return
+    }
+    const protocol = parsedUrl.protocol === 'https:' ? https : http
     const file = fs.createWriteStream(destPath)
     let settled = false
     const settle = (fn, val) => {
       if (settled) return
       settled = true
-      try { file.close() } catch {}
-      fn(val)
+      // Wait for FD to fully close before resolving so callers can safely
+      // move/open the file (avoids EBUSY on Windows)
+      file.close(() => fn(val))
     }
     const cleanup = () => fs.unlink(destPath, () => {})
 
@@ -266,23 +326,52 @@ function downloadToFile(url, destPath, redirects = 0) {
       if (response.statusCode === 301 || response.statusCode === 302) {
         const location = response.headers.location
         if (!location) { cleanup(); settle(reject, new Error('Redirect without Location')); return }
+        // Remove the file error listener first — no window where the listener
+        // is still attached but cleanup() could race the recursive open.
+        file.removeAllListeners('error')
         // Mark settled before destroying so the req.on('error') handler below
         // cannot spuriously reject if req emits an error after destruction.
         settled = true
-        try { file.destroy() } catch {}
-        cleanup()
+        // Drain the redirect response body to release the socket promptly
+        try { response.resume() } catch {}
         try { req.destroy() } catch {}
-        downloadToFile(location, destPath, redirects + 1).then(resolve).catch(reject)
+        file.close(closeErr => {
+          if (closeErr) { cleanup(); reject(closeErr); return }
+          downloadToFile(location, destPath, redirects + 1).then(resolve).catch(reject)
+        })
         return
       }
       if (response.statusCode !== 200) {
         cleanup(); settle(reject, new Error(`HTTP ${response.statusCode}`)); return
       }
-      response.on('error', err => { cleanup(); settle(reject, err) })
-      response.pipe(file)
+      // Manually write chunks (no pipe) so the 512 MB cap is enforced before
+      // any data reaches disk — pipe buffers make post-hoc unpipe unreliable.
+      let bytesReceived = 0
+      const MAX_BYTES = 512 * 1024 * 1024
+      response.on('data', chunk => {
+        if (settled) return
+        bytesReceived += chunk.length
+        if (bytesReceived > MAX_BYTES) {
+          cleanup()
+          settle(reject, new Error('Response too large (>512 MB)'))
+          try { response.destroy() } catch {}
+          return
+        }
+        // Handle backpressure — pause the network stream when the disk write buffer is full
+        const ok = file.write(chunk)
+        if (!ok) {
+          response.pause()
+          file.once('drain', () => { if (!settled) response.resume() })
+        }
+      })
+      response.on('end', () => { if (!settled) file.end() })
+      response.on('error', err => { if (settled) return; cleanup(); settle(reject, err) })
       file.on('finish', () => settle(resolve))
     })
-    req.on('error', err => { cleanup(); settle(reject, err) })
+    // 30-second idle timeout — prevents hanging forever if the server accepts
+    // the TCP connection but never sends bytes.
+    req.setTimeout(30_000, () => req.destroy(new Error('Request timed out')))
+    req.on('error', err => { if (settled) return; cleanup(); settle(reject, err) })
     file.on('error', err => { if (settled) return; cleanup(); settle(reject, err) })
   })
 }
@@ -327,7 +416,7 @@ function registerIpcHandlers() {
   })
 
   // Clipboard
-  ipcMain.handle('clipboard-write-text', (_e, text) => clipboard.writeText(String(text ?? '')))
+  ipcMain.handle('clipboard-write-text', (_e, text) => clipboard.writeText(String(text ?? '').slice(0, 1_000_000)))
   ipcMain.handle('clipboard-read-text', () => { try { return clipboard.readText() } catch { return '' } })
 
   // Deep links
@@ -360,6 +449,7 @@ function registerIpcHandlers() {
 
   ipcMain.on('select-display-media-source', (_e, requestId, sourceId, withAudio) => {
     try {
+      if (typeof requestId !== 'string') return
       const req = pendingDisplayRequests.get(requestId)
       if (!req) {
         // Unknown requestId — clear stale cache to avoid memory leak
@@ -389,6 +479,9 @@ function registerIpcHandlers() {
   // ── Global shortcuts ────────────────────────────────────────────────────────
   ipcMain.handle('register-global-shortcut', (_e, { accelerator, id }) => {
     if (!accelerator || !id) return false
+    if (typeof accelerator !== 'string' || accelerator.length > 64) return false
+    if (typeof id !== 'string' || id.length > 128) return false
+    if (registeredShortcuts.size >= 32 && !registeredShortcuts.has(accelerator)) return false
     try {
       if (registeredShortcuts.has(accelerator)) globalShortcut.unregister(accelerator)
       const ok = globalShortcut.register(accelerator, () => {
@@ -442,8 +535,14 @@ function registerIpcHandlers() {
   ipcMain.handle('open-input-monitoring-settings', () => {})
 
   // ── App badge ───────────────────────────────────────────────────────────────
-  ipcMain.handle('app-set-badge', (_e, count) => { try { app.badgeCount = count ?? 0 } catch {} })
-  ipcMain.on('set-badge-count', (_e, count) => { try { app.badgeCount = count ?? 0 } catch {} })
+  // Debounce rapid-fire badge updates (e.g. per-message increments) to avoid
+  // flooding the OS taskbar overlay with high-frequency writes.
+  ipcMain.on('set-badge-count', (_e, count) => {
+    clearTimeout(_badgeDebounceTimer)
+    _badgeDebounceTimer = setTimeout(() => {
+      try { const n = Math.max(0, Math.trunc(Number(count ?? 0))); app.badgeCount = isFinite(n) ? n : 0 } catch {}
+    }, 50)
+  })
   ipcMain.handle('get-badge-count', () => { try { return app.badgeCount ?? 0 } catch { return 0 } })
   ipcMain.handle('bounce-dock', () => -1) // async now — no more sendSync
   ipcMain.on('cancel-bounce-dock', () => {})
@@ -456,7 +555,10 @@ function registerIpcHandlers() {
       const clamped = Math.min(3.0, Math.max(0.5, Number(factor)))
       if (win && !win.isDestroyed() && isFinite(clamped)) {
         win.webContents.setZoomFactor(clamped)
-        try { fs.writeFileSync(zoomFilePath, JSON.stringify({ factor: clamped })) } catch {}
+        // Only persist zoom from the main window — popups should not overwrite it
+        if (win === mainWindow) {
+          try { fs.writeFileSync(zoomFilePath, JSON.stringify({ factor: clamped })) } catch {}
+        }
       }
     } catch {}
   })
@@ -488,7 +590,13 @@ function registerIpcHandlers() {
       if (!['http:', 'https:'].includes(parsed.protocol)) {
         return { success: false, error: 'Invalid URL protocol' }
       }
-      const result = await dialog.showSaveDialog(win, { defaultPath })
+      // Sanitize defaultPath to a filename only — prevents renderer from pre-seeding
+      // the dialog to overwrite sensitive system files via an absolute path.
+      // ASCII-only allowlist — strips Unicode homoglyphs, RTLO, and other confusables.
+      // Also reject pure-dot names (e.g. "..") which some dialogs treat as directory refs.
+      const rawName = path.basename(String(defaultPath ?? 'download')).replace(/[^A-Za-z0-9 .\-_]/g, '_')
+      const safeName = (rawName && !/^\.+$/.test(rawName)) ? rawName : 'download'
+      const result = await dialog.showSaveDialog(win, { defaultPath: safeName })
       if (result.canceled || !result.filePath) return { success: false }
       await downloadToFile(url, result.filePath)
       return { success: true, path: result.filePath }
@@ -499,7 +607,8 @@ function registerIpcHandlers() {
 
   // ── Notifications ───────────────────────────────────────────────────────────
   ipcMain.handle('show-notification', async (_e, options) => {
-    const id = `n-${++notificationIdCounter}`
+    if (activeNotifications.size >= 50) return { id: null }
+    const id = `n-${crypto.randomUUID()}`
     if (!Notification.isSupported()) return { id }
     try {
       let url = null
@@ -509,13 +618,20 @@ function registerIpcHandlers() {
           if (['http:', 'https:', 'mailto:'].includes(p.protocol)) url = options.url
         } catch {}
       }
+      // Convert data URI to NativeImage — Notification.icon expects a NativeImage
+      // or file path, not a raw data URI. Also validates through Electron's image
+      // pipeline and caps size to prevent DoS via large icon payloads.
+      let notifIcon
+      if (options.icon && typeof options.icon === 'string' &&
+          (options.icon.startsWith('data:image/png;base64,') || options.icon.startsWith('data:image/jpeg;base64,')) &&
+          options.icon.length <= 2 * 1024 * 1024) {
+        try { notifIcon = nativeImage.createFromDataURL(options.icon) } catch {}
+      }
       const n = new Notification({
-        title: String(options.title ?? 'Notification'),
-        body: String(options.body ?? ''),
+        title: String(options.title ?? 'Notification').slice(0, 256),
+        body: String(options.body ?? '').slice(0, 1024),
         silent: Boolean(options.silent),
-        ...(options.icon && typeof options.icon === 'string' &&
-        (options.icon.startsWith('data:') || options.icon.startsWith('https://') || options.icon.startsWith('http://'))
-        ? { icon: options.icon } : {}),
+        ...(notifIcon ? { icon: notifIcon } : {}),
       })
       // Auto-cleanup after 30s in case 'close' event never fires on this platform
       const autoCleanTimeout = setTimeout(() => {
@@ -546,6 +662,7 @@ function registerIpcHandlers() {
     return { id }
   })
   ipcMain.on('close-notification', (_e, id) => {
+    if (typeof id !== 'string') return
     try {
       const entry = activeNotifications.get(id)
       if (entry) {
@@ -557,7 +674,10 @@ function registerIpcHandlers() {
   })
   ipcMain.on('close-notifications', (_e, ids) => {
     if (!Array.isArray(ids)) return
-    for (const id of ids) {
+    const limit = Math.min(ids.length, 200)
+    for (let i = 0; i < limit; i++) {
+      const id = ids[i]
+      if (typeof id !== 'string') continue
       try {
         const entry = activeNotifications.get(id)
         if (entry) {
@@ -593,11 +713,16 @@ function registerIpcHandlers() {
   ipcMain.handle('global-key-hook-is-running', () => hookStarted)
   ipcMain.handle('check-input-monitoring-access', () => true)
   ipcMain.handle('global-key-hook-register', (_e, options) => {
-    if (typeof options?.id !== 'string' || !options.id) return false
-    const keycode = Number.isInteger(options.keycode) && options.keycode >= 0 ? options.keycode : 0
-    const mouseButton = Number.isInteger(options.mouseButton) ? options.mouseButton : undefined
-    // Require at least one trigger — keycode 0 with no mouseButton would match nothing
-    if (keycode === 0 && mouseButton === undefined) return false
+    if (typeof options?.id !== 'string' || !options.id || options.id.length > 128) return false
+    if (registeredKeybinds.size >= 64 && !registeredKeybinds.has(options.id)) return false
+    // Distinguish "not provided" (undefined) from "provided as 0" (valid on some platforms)
+    const keycodeProvided = Number.isInteger(options.keycode) && options.keycode >= 0
+    const keycode = keycodeProvided ? options.keycode : 0
+    const mouseButton = Number.isInteger(options.mouseButton) &&
+      options.mouseButton >= 1 && options.mouseButton <= 5
+      ? options.mouseButton : undefined
+    // Require at least one trigger to be explicitly provided
+    if (!keycodeProvided && mouseButton === undefined) return false
     registeredKeybinds.set(options.id, {
       id: options.id,
       keycode,
@@ -619,23 +744,40 @@ function registerIpcHandlers() {
   ipcMain.handle('global-key-hook-unregister-all', () => { registeredKeybinds.clear(); return true })
 
   // ── Server URL config ───────────────────────────────────────────────────────
+  ipcMain.handle('config-get-server-url-current', () => appUrl || APP_URL)
   ipcMain.handle('configure-server', () => showConfigWindow())
-  ipcMain.on('config-cancel-first-run', () => { isQuitting = true; app.quit() })
-  ipcMain.on('config-set-server-url', (_e, url) => {
+  ipcMain.on('config-cancel-first-run', event => {
+    // Only accept from the config window itself, not from other renderers
+    if (!configWindow || event.sender.id !== configWindow.webContents.id) return
+    isQuitting = true; app.quit()
+  })
+  // Use handle so the renderer can await acknowledgement before closing its window
+  ipcMain.handle('config-set-server-url', (_e, url) => {
     try {
       const p = new URL(url)
-      if (!['http:', 'https:'].includes(p.protocol)) return
+      if (!['http:', 'https:'].includes(p.protocol)) return false
       appUrl = url
       saveServerUrl(url)
+      // Destroy the config window immediately to prevent a second IPC call racing in
+      if (configWindow && !configWindow.isDestroyed()) {
+        try { configWindow.destroy() } catch {}
+        configWindow = null
+      }
       if (isWindowReady()) {
         // Reconfiguring an existing session — just reload
         mainWindow.loadURL(appUrl)
       } else {
         // First run — main window doesn't exist yet, create it now
-        createWindow()
-        createTray()
+        try {
+          createWindow()
+          createTray()
+        } catch (err) {
+          console.error('[Config] Failed to create window on first run:', err)
+          app.quit()
+        }
       }
-    } catch {}
+      return true
+    } catch { return false }
   })
 }
 
@@ -651,14 +793,19 @@ function showConfigWindow(firstRun = false) {
     title: firstRun ? `Welcome to ${APP_NAME}` : `${APP_NAME} — Configure Server`,
     autoHideMenuBar: true,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
+      // No nodeIntegration — the config preload uses contextBridge to expose only
+      // the two IPC calls this window needs (set-server-url, cancel-first-run).
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'config-preload.js'),
     },
   })
-  Menu.setApplicationMenu(null)
-  const serverUrlJson = JSON.stringify(appUrl || APP_URL)
+  // firstRun is a boolean — JSON.stringify produces "true" or "false", never injectable
   const firstRunJson = JSON.stringify(firstRun)
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  // Server URL is fetched from the main process at runtime (no string interpolation into script)
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>
   body{background:#1a1a2e;color:#ccc;font-family:sans-serif;padding:24px;margin:0}
   h2{margin:0 0 14px;color:#fff;font-size:16px}
   .sub{font-size:12px;opacity:.55;margin:-10px 0 16px}
@@ -684,36 +831,37 @@ ${firstRun ? `<h2>Connect to a Fluxer Server</h2><p class="sub">Enter the addres
   <button class="cancel" onclick="cancel()">${firstRun ? 'Quit' : 'Cancel'}</button>
 </div>
 <script>
-const {ipcRenderer}=require('electron')
-const SERVER_URL=${serverUrlJson}
 const FIRST_RUN=${firstRunJson}
 const inp=document.getElementById('u')
-inp.value=SERVER_URL
-inp.select()
-function save(){
+// Fetch current server URL from main process — no string interpolation into script
+window.configApi.getServerUrl().then(url=>{inp.value=url;inp.select()})
+async function save(){
   const v=inp.value.trim()
   if(!v){document.getElementById('err').textContent='Please enter a URL.';return}
   try{const p=new URL(v);if(!['http:','https:'].includes(p.protocol)){throw new Error()}}
   catch{document.getElementById('err').textContent='Must start with http:// or https://';return}
-  ipcRenderer.send('config-set-server-url',v)
+  // Await acknowledgement from main before closing so the IPC message is not lost
+  await window.configApi.setServerUrl(v)
   window.close()
 }
 function cancel(){
-  if(FIRST_RUN){ipcRenderer.send('config-cancel-first-run')}
+  if(FIRST_RUN){window.configApi.cancelFirstRun()}
   window.close()
 }
 inp.addEventListener('keydown',e=>{if(e.key==='Enter')save()})
 </script></body></html>`
-  configWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
-  // Block any navigation away from the inline data: URL — nodeIntegration is enabled
-  // so an unguarded external navigation would give full Node.js access to a remote page.
-  configWindow.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith('data:')) event.preventDefault()
+  // Block all navigation — will-navigate does not fire for the initial loadURL,
+  // only for page-initiated navigations, so blocking unconditionally is safe.
+  configWindow.webContents.on('will-navigate', event => {
+    event.preventDefault()
   })
+  configWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  configWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html))
   configWindow.on('closed', () => {
     configWindow = null
-    // If user closes the first-run window without saving, quit
-    if (firstRun && !isWindowReady()) app.quit()
+    // If user closes the first-run window without saving, quit.
+    // Guard isQuitting to avoid a double-quit if cancel() already triggered it.
+    if (firstRun && !isWindowReady() && !isQuitting) { isQuitting = true; app.quit() }
   })
 }
 
@@ -775,7 +923,7 @@ function createWindow() {
       try { callback({ video: null }) } catch {}
       return
     }
-    const requestId = `dmr-${++displayRequestCounter}`
+    const requestId = `dmr-${crypto.randomUUID()}`
     const timeout = setTimeout(() => {
       const req = pendingDisplayRequests.get(requestId)
       if (req) {
@@ -794,8 +942,16 @@ function createWindow() {
         try { callback({ video: null }) } catch {}
         return
       }
+      // Only pass the origin if it matches the app's own host AND protocol —
+      // otherwise a third-party/downgraded iframe's origin would be leaked.
+      let frameOrigin = new URL(appUrl).origin
+      try {
+        const u = new URL(request.requestingFrame?.url ?? appUrl)
+        const a = new URL(appUrl)
+        if (u.host === a.host && u.protocol === a.protocol) frameOrigin = u.origin
+      } catch {}
       mainWindow.webContents.send('display-media-requested', requestId, {
-        origin: request.requestingFrame?.url ?? appUrl,
+        origin: frameOrigin,
       })
     } catch (err) {
       // If we can't notify the renderer, cancel immediately
@@ -814,24 +970,22 @@ function createWindow() {
     try { mainWindow.webContents.send('window-maximize-change', false) } catch {}
   })
 
-  // Restore persisted zoom before page loads
+  // zoomFilePath is used both in did-finish-load (restore) and the set-zoom-factor handler
   const zoomFilePath = path.join(app.getPath('userData'), 'zoom.json')
-  try {
-    const saved = JSON.parse(fs.readFileSync(zoomFilePath, 'utf8'))
-    const factor = Number(saved?.factor)
-    if (isFinite(factor) && factor >= 0.5 && factor <= 3.0) {
-      mainWindow.webContents.setZoomFactor(factor)
-    }
-  } catch {}
 
   mainWindow.loadURL(appUrl)
-  mainWindow.once('ready-to-show', () => { if (!mainWindow.isDestroyed()) mainWindow.show() })
+  mainWindow.once('ready-to-show', () => { try { if (!mainWindow.isDestroyed()) mainWindow.show() } catch {} })
 
   // Show a friendly error page if the server is unreachable
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
-    // Skip our own generated error pages (data: URLs) and internal chrome:// pages
-    if (validatedURL && (validatedURL.startsWith('data:') || validatedURL.startsWith('chrome'))) return
+    // Skip our own generated error pages (data: URLs) and internal chrome pages
+    if (validatedURL && (
+      validatedURL.startsWith('data:') ||
+      validatedURL.startsWith('chrome://') ||
+      validatedURL.startsWith('chrome-error://')
+    )) return
     if (!isWindowReady()) return
+    if (isQuitting) return
     if (!mainWindow.isVisible()) mainWindow.show()
     let hint = ''
     if (errorCode === -105) {
@@ -843,8 +997,14 @@ function createWindow() {
     } else if (errorCode === -118) {
       hint = '<p class="hint">Tip: Connection timed out — the server may be unreachable or behind a firewall.</p>'
     }
+    // Replace < with its unicode escape so the HTML parser never sees a tag
+    // boundary inside the <script> block, regardless of what appUrl contains.
     const serverUrlJson = JSON.stringify(appUrl)
+      .replace(/</g, '\\u003c')
+      .replace(/\u2028/g, '\\u2028')
+      .replace(/\u2029/g, '\\u2029')
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Connection Failed</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
 <style>
   body{background:#1a1a2e;color:#ccc;font-family:sans-serif;display:flex;
        flex-direction:column;align-items:center;justify-content:center;
@@ -880,6 +1040,18 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
   // even if Fluxer's own CSS hasn't set -webkit-app-region:drag yet
   mainWindow.webContents.on('did-finish-load', () => {
     if (!isWindowReady()) return
+    // Skip error pages and internal pages — only inject into real app content
+    const loadedUrl = mainWindow.webContents.getURL()
+    if (loadedUrl.startsWith('data:') || loadedUrl.startsWith('chrome://') || loadedUrl.startsWith('chrome-error://')) return
+    // Restore persisted zoom here — Electron ≥ 28 resets zoom to 1.0 on each navigation,
+    // so setZoomFactor called before loadURL has no lasting effect.
+    try {
+      const saved = JSON.parse(fs.readFileSync(zoomFilePath, 'utf8'))
+      const factor = Number(saved?.factor)
+      if (isFinite(factor) && factor >= 0.5 && factor <= 3.0) {
+        mainWindow.webContents.setZoomFactor(factor)
+      }
+    } catch {}
     mainWindow.webContents.insertCSS(`
       [class*="titleBar"i]:not(button):not(input):not(a),
       [class*="title-bar"i]:not(button):not(input):not(a),
@@ -893,10 +1065,16 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
     `).catch(err => console.debug('[DragRegion] CSS injection failed:', err.message))
   })
 
-  // Clear registered keybinds on navigation so stale binds don't fire twice.
-  // Also cancel pending display-media requests whose renderer UI is now gone.
+  // Clear registered keybinds and global shortcuts on navigation so stale binds
+  // don't fire into the new page. Also cancel pending display-media requests.
   mainWindow.webContents.on('did-navigate', () => {
     registeredKeybinds.clear()
+    // Unregister only the shortcuts we own — avoids nuking any shortcuts that
+    // other Electron internal code may have registered on the same instance.
+    for (const accelerator of registeredShortcuts.keys()) {
+      try { globalShortcut.unregister(accelerator) } catch {}
+    }
+    registeredShortcuts.clear()
     for (const req of pendingDisplayRequests.values()) {
       clearTimeout(req.timeout)
       try { req.callback({ video: null }) } catch {}
@@ -929,19 +1107,28 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
     if (!isQuitting) {
       event.preventDefault()
       try { mainWindow.hide() } catch {}
-      if (!fs.existsSync(trayHintFlagPath)) {
-        try { fs.writeFileSync(trayHintFlagPath, '1') } catch {}
+      try {
+        // Atomic exclusive create — fails if the file already exists, eliminating
+        // the TOCTOU window between existsSync and writeFileSync.
+        fs.writeFileSync(trayHintFlagPath, '1', { flag: 'wx' })
+        // Only reached if this is the first close (file didn't exist)
         if (tray && Notification.isSupported()) {
-          try { new Notification({ title: APP_NAME, body: 'Fluxer is still running in the system tray.' }).show() } catch {}
+          new Notification({ title: APP_NAME, body: 'Fluxer is still running in the system tray.' }).show()
         }
-      }
+      } catch {}
     }
   })
 
   // Same-origin popups get the preload so window.electron is available
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     let sameOrigin = false
-    try { sameOrigin = new URL(url).origin === new URL(appUrl).origin } catch {}
+    try {
+      const u = new URL(url)
+      const a = new URL(appUrl)
+      // Require both protocol and host to match — allowing http: when the app uses
+      // https: would let a MITM server serve content that gets the preload injected.
+      sameOrigin = u.protocol === a.protocol && u.host === a.host
+    } catch {}
     if (sameOrigin) {
       return {
         action: 'allow',
@@ -950,6 +1137,7 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
+            webSecurity: true,
           },
         },
       }
@@ -961,10 +1149,48 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
     return { action: 'deny' }
   })
 
+  // Attach security guards to same-origin popups opened by setWindowOpenHandler.
+  // Without this, a popup can navigate to a third-party page that still has the
+  // preload / window.electron API available.
+  mainWindow.webContents.on('did-create-window', popup => {
+    // Capture host AND protocol at popup-open time so that a later appUrl change
+    // (via "Change Server URL") cannot grant this popup access to the new server,
+    // and so a protocol-downgrade (https→http) on the same host is also blocked.
+    let expectedPopupHost = ''
+    let expectedPopupProtocol = ''
+    try {
+      const a = new URL(appUrl)
+      expectedPopupHost = a.host
+      expectedPopupProtocol = a.protocol
+    } catch {}
+    popup.webContents.on('will-navigate', (event, url) => {
+      let isAppOrigin = false
+      try {
+        const u = new URL(url)
+        isAppOrigin = u.protocol === expectedPopupProtocol && u.host === expectedPopupHost
+      } catch {}
+      if (!isAppOrigin) {
+        event.preventDefault()
+        try {
+          const parsed = new URL(url)
+          if (['http:', 'https:'].includes(parsed.protocol)) shell.openExternal(url)
+        } catch {}
+      }
+    })
+    // Prevent popups from spawning further popups
+    popup.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  })
+
   // Block navigation away from the app domain
   mainWindow.webContents.on('will-navigate', (event, url) => {
     let isAppOrigin = false
-    try { isAppOrigin = new URL(url).origin === new URL(appUrl).origin } catch {}
+    try {
+      const u = new URL(url)
+      const a = new URL(appUrl)
+      // Compare host:port (protocol-independent, consistent with setWindowOpenHandler).
+      // Require http/https to exclude data:, javascript:, chrome:, etc.
+      isAppOrigin = ['http:', 'https:'].includes(u.protocol) && u.host === a.host
+    } catch {}
     if (!isAppOrigin) {
       event.preventDefault()
       try {
@@ -978,27 +1204,56 @@ function configure(){if(window.electron&&window.electron.configureServer){clearI
 // ─────────────────────────────────────────────────────────────────────────────
 // Tray
 // ─────────────────────────────────────────────────────────────────────────────
-function createTray() {
-  tray = new Tray(nativeImage.createFromPath(ICON_PATH))
-  tray.setToolTip(APP_NAME)
+function rebuildTrayMenu() {
+  if (!tray || tray.isDestroyed()) return
   tray.setContextMenu(Menu.buildFromTemplate([
     {
       label: 'Open Fluxer',
       click: () => {
-        // Recreate window if somehow destroyed while tray is alive
         if (!isWindowReady()) { createWindow(); return }
         mainWindow.show()
         mainWindow.focus()
       },
     },
     { type: 'separator' },
+    {
+      label: 'Theme',
+      submenu: [
+        {
+          label: 'Dark',
+          type: 'radio',
+          checked: currentTheme === 'dark',
+          click: () => applyTheme('dark'),
+        },
+        {
+          label: 'Light',
+          type: 'radio',
+          checked: currentTheme === 'light',
+          click: () => applyTheme('light'),
+        },
+        {
+          label: 'System',
+          type: 'radio',
+          checked: currentTheme === 'system',
+          click: () => applyTheme('system'),
+        },
+      ],
+    },
+    { type: 'separator' },
+    { label: 'Settings', click: () => { if (isWindowReady()) mainWindow.webContents.send('open-settings') } },
     { label: 'Change Server URL…', click: () => showConfigWindow() },
     { type: 'separator' },
     { label: 'Quit', click: () => { isQuitting = true; app.quit() } },
   ]))
+}
 
-  // Single click toggles visibility (Discord/Slack behaviour);
-  // handles minimized state correctly
+function createTray() {
+  if (tray && !tray.isDestroyed()) return
+  tray = new Tray(nativeImage.createFromPath(ICON_PATH))
+  tray.setToolTip(APP_NAME)
+  rebuildTrayMenu()
+
+  // Single click toggles visibility (Discord/Slack behaviour)
   tray.on('click', () => {
     if (!isWindowReady()) { createWindow(); return }
     try {
@@ -1024,9 +1279,12 @@ function createTray() {
 // App lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
 app.whenReady().then(() => {
-  appUrl = loadServerUrl()
+  const savedUrl = loadServerUrl()
+  if (savedUrl) appUrl = savedUrl // keep APP_URL as fallback so appUrl is never null
+  currentTheme = loadTheme()
+  nativeTheme.themeSource = currentTheme
   registerIpcHandlers()
-  if (appUrl) {
+  if (savedUrl) {
     // Returning user — go straight to the app
     createWindow()
     createTray()
@@ -1040,10 +1298,16 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => { /* stay alive in tray */ })
-app.on('activate', () => { if (!isWindowReady()) createWindow() })
+app.on('activate', () => {
+  // If the first-run config window is open, don't bypass it by creating the main window
+  if (configWindow && !configWindow.isDestroyed()) return
+  if (!isWindowReady()) createWindow()
+  if (!tray || tray.isDestroyed()) createTray()
+})
 app.on('before-quit', () => {
   isQuitting = true
   stopHook()
+  clearTimeout(_badgeDebounceTimer)
   globalShortcut.unregisterAll()
   registeredShortcuts.clear()
 
