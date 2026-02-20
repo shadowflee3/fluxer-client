@@ -38,8 +38,9 @@ async function createIcons() {
     pngBuffers.push(buffer)
   }
 
-  // Save 256px PNG
-  fs.writeFileSync(path.join(assetsDir, 'icon.png'), pngBuffers[5])
+  // Save 1024px PNG — Mac requires ≥512px; Linux and Windows also use this
+  const png1024 = await sharp(Buffer.from(svgIcon)).resize(1024, 1024).png().toBuffer()
+  fs.writeFileSync(path.join(assetsDir, 'icon.png'), png1024)
   console.log('  icon.png created')
 
   // Convert to multi-size ICO
